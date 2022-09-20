@@ -134,6 +134,144 @@ private:
   void** limit;
 };
 
+// -------------------------------------------------------------------
+
+class EnvironmentSet {
+  // A collection of Environments.
+  //
+  // This class also provides access to the current EventLoop's reference to the currently-active
+  // EnvironmentSet.
+
+public:
+  class Scope;
+  // Put a `Scope(set)` on the stack to make an environment current. Requires a current EventLoop.
+
+  static EnvironmentSet create(void* typeKey, Own<Environment> environment);
+  // Construct a new EnvironmentSet containing `environment`. If an EnvironmentSet is already
+  // current, all of its environments, save any identified by `typeKey`, are adopted.
+
+  static Maybe<EnvironmentSet&> tryGetCurrent();
+  // Call `EnvironmentSet::tryGetCurrent()` to access the current EnvironmentSet, if any.
+
+  KJ_DISALLOW_COPY(EnvironmentSet);
+  EnvironmentSet(EnvironmentSet&&) = default;
+  ~EnvironmentSet() noexcept(false);
+
+  auto operator==(const EnvironmentSet& other) const { return impl.get() == other.impl.get(); };
+
+  EnvironmentSet clone();
+  // Return a new EnvironmentSet which compares equal to this one.
+
+  Maybe<Environment&> tryGetEnvironment(void* typeKey);
+  // Return the specific Environment associated with `typeKey`.
+
+private:
+  Maybe<EnvironmentSet&>& currentEnvironmentSet;
+  // Reference to EventLoop::currentEnvironmentSet, so we can save some dereferencing during Scope
+  // construction. In KJ_DEBUG builds, this is required to refer to the same as the current event
+  // loop's `EventLoop::currentEnvironmentSet`.
+
+  struct Impl;
+  Own<Impl> impl;
+  // This exists just so we don't have to include kj/map.h.
+
+  explicit EnvironmentSet(Maybe<EnvironmentSet&>&currentEnvironmentSet, Own<Impl> impl);
+  // Constructor used by `create()` and `clone()`.
+};
+
+class EnvironmentSet::Scope {
+  // Construct one of these on the stack whenever you need to push an EnvironmentSet reference onto
+  // the EnvironmentSet stack. While one of these is alive, `EnvironmentSet::tryGetCurrent()` will
+  // return the newly-pushed EnvironmentSet reference.
+
+public:
+  explicit Scope(EnvironmentSet& environmentSet);
+  ~Scope() noexcept(false);
+  KJ_DISALLOW_COPY(Scope);
+
+private:
+  Maybe<EnvironmentSet&>& currentEnvironmentSet;
+  Maybe<EnvironmentSet&> previous;
+};
+
+class Environment: public kj::Refcounted {
+  // Base class of Environment::Holder<T>.
+
+public:
+  template <typename T> class Holder;
+
+  KJ_DISALLOW_COPY(Environment);
+  ~Environment() noexcept(false) = 0;
+
+private:
+  Environment() = default;
+};
+
+template <typename T>
+class Environment::Holder final: public Environment {
+public:
+  template <typename... Args>
+  Holder(Args&&... args): environment(fwd<Args>(args)...) {}
+
+  T environment;
+
+  static void* typeKey() {
+    static bool uniqueAddress;
+    return &uniqueAddress;
+  }
+};
+
+}  // namespace _
+
+template <typename E, typename Func>
+PromiseForResult<Func, void> runInEnvironment(E&& environment, Func&& func) {
+  PromiseForResult<Func, void> result = nullptr;
+  KJ_IF_MAYBE(e, kj::runCatchingExceptions([&]() {
+    // TODO(now): The lambda gymnastics here prevent pure-synchronous callbacks from capturing the
+    //   environment set in their returned promises. However, it doesn't do anything about promise-
+    //   returning functions, which I realize now is a much bigger issue. I need a
+    //   DropEnvironmentSetPromiseNode to terminate the chain.
+    result = [&]() {
+      using Holder = _::Environment::Holder<Decay<E>>;
+      auto environmentSet = _::EnvironmentSet::create(
+          Holder::typeKey(), refcounted<Holder>(fwd<E>(environment)));
+      _::EnvironmentSet::Scope scope(environmentSet);
+      using T = _::ReturnType<Func, void>;
+      // TODO(now): Can't fwd(func) because MaybeVoidCaller won't have it.
+      return _::MaybeVoidCaller<_::Void, _::FixVoid<T>>::apply(func, {});
+    }();
+  })) {
+    result = kj::mv(*e);
+  }
+  // TODO(now): Implement CloseEnvironmentPromiseNode or something like that.
+  //return _::escapeEnvironment(kj::mv(result));
+  return result;
+}
+
+template <typename T>
+T& getEnvironment() {
+  auto maybeEnvironment = tryGetEnvironment<T>();
+  KJ_IREQUIRE(maybeEnvironment != nullptr, "Currently executing code has no Environment");
+  return *_::readMaybe(maybeEnvironment);
+}
+
+template <typename T>
+kj::Maybe<T&> tryGetEnvironment() {
+  using Holder = _::Environment::Holder<T>;
+
+  KJ_IF_MAYBE(set, _::EnvironmentSet::tryGetCurrent()) {
+    KJ_IF_MAYBE(holder, set->tryGetEnvironment(Holder::typeKey())) {
+      return downcast<Holder>(*holder).environment;
+    }
+  }
+
+  return nullptr;
+}
+
+namespace _ {
+
+// -------------------------------------------------------------------
+
 class Event: private AsyncObject {
   // An event waiting to be executed.  Not for direct use by applications -- promises use this
   // internally.
@@ -200,9 +338,10 @@ protected:
   // caller.  This is the only way that an event can delete itself as a result of firing, as
   // doing so from within fire() will throw an exception.
 
+  EventLoop& loop;
+
 private:
   friend class kj::EventLoop;
-  EventLoop& loop;
   Event* next;
   Event** prev;
   bool firing = false;
@@ -228,11 +367,13 @@ public:
   // never be armed, only the new one. If called again after the event was armed, the new event
   // will be armed immediately. Can be called with nullptr to un-register the existing event.
 
-  virtual void setSelfPointer(Own<PromiseNode>* selfPtr) noexcept;
+  virtual Maybe<EnvironmentSet&> setSelfPointer(Own<PromiseNode>* selfPtr) noexcept;
   // Tells the node that `selfPtr` is the pointer that owns this node, and will continue to own
-  // this node until it is destroyed or setSelfPointer() is called again.  ChainPromiseNode uses
-  // this to shorten redundant chains.  The default implementation does nothing; only
-  // ChainPromiseNode should implement this.
+  // this node until it is destroyed or setSelfPointer() is called again. We additionally use this
+  // as a way to propagate the EnvironmentSet from this node to its new owner.
+  //
+  // ChainPromiseNode uses the `selfPtr` parameter to shorten redundant chains. All other
+  // implementations should simply return their EnvironmentSet.
 
   virtual void get(ExceptionOrValue& output) noexcept = 0;
   // Get the result.  `output` points to an ExceptionOr<T> into which the result will be written.
@@ -277,6 +418,9 @@ public:
     return T(false, kj::mv(node));
   }
 
+  void adoptEnvironment();
+  // Set `environmentSet` to the currently active EnvironmentSet.
+
 protected:
   class OnReadyEvent {
     // Helper class for implementing onReady().
@@ -296,6 +440,9 @@ protected:
   private:
     Event* event = nullptr;
   };
+
+protected:
+  Maybe<EnvironmentSet> environmentSet;
 };
 
 // -------------------------------------------------------------------
@@ -374,9 +521,16 @@ public:
     // We need to make sure the dependency is deleted before we delete the attachment because the
     // dependency may be using the attachment.
     dropDependency();
+
+    // HACK: Make sure we have an active EnvironmentSet scope while we destroy the user callbacks.
+    KJ_IF_MAYBE(set, environmentSet) {
+      environmentSetScope.emplace(*set);
+    }
   }
 
-private:
+  Maybe<EnvironmentSet::Scope> environmentSetScope;
+  // HACK: Non-null during destruction, so `attachment` gets the environment set.
+
   Attachment attachment;
 };
 
@@ -549,9 +703,17 @@ public:
     // is a common pattern for the continuations to hold ownership of objects that might be in-use
     // by the dependency.
     dropDependency();
+
+    // HACK: Make sure we have an active EnvironmentSet scope while we destroy the user callbacks.
+    KJ_IF_MAYBE(set, environmentSet) {
+      environmentSetScope.emplace(*set);
+    }
   }
 
 private:
+  Maybe<EnvironmentSet::Scope> environmentSetScope;
+  // HACK: Non-null during destruction, so `func` and `errorHandler` get the environment set.
+
   Func func;
   ErrorFunc errorHandler;
 
@@ -667,6 +829,7 @@ public:
 
 private:
   Own<PromiseNode> inner;
+  Maybe<EnvironmentSet> environmentSet;
   ExceptionOrValue& resultRef;
 
   ForkBranchBase* headBranch = nullptr;
@@ -731,7 +894,7 @@ public:
   ~ChainPromiseNode() noexcept(false);
 
   void onReady(Event* event) noexcept override;
-  void setSelfPointer(Own<PromiseNode>* selfPtr) noexcept override;
+  Maybe<EnvironmentSet&> setSelfPointer(Own<PromiseNode>* selfPtr) noexcept override;
   void get(ExceptionOrValue& output) noexcept override;
   void tracePromise(TraceBuilder& builder, bool stopAtNextEvent) override;
 
@@ -942,6 +1105,8 @@ Own<PromiseNode> spark(Own<PromiseNode>&& node, SourceLocation location) {
 
 class AdapterPromiseNodeBase: public PromiseNode {
 public:
+  explicit AdapterPromiseNodeBase();
+
   void onReady(Event* event) noexcept override;
   void tracePromise(TraceBuilder& builder, bool stopAtNextEvent) override;
 
@@ -973,6 +1138,9 @@ private:
   ExceptionOr<T> result;
   bool waiting = true;
   Adapter adapter;
+  // TODO(now): Destroy adapter under an EnvironmentSet::Scope.
+  // TODO(now): Idea: we capture the current EnvironmentSet from onReady(). If we're destroyed
+  //   _before_ onReady() is called, we can call currentEventLoop() then.
 
   void fulfill(T&& value) override {
     if (waiting) {
@@ -1045,7 +1213,13 @@ public:
       : FiberBase(stackSize, result, location), func(kj::fwd<Func>(func)) {}
   explicit Fiber(const FiberPool& pool, Func&& func, SourceLocation location)
       : FiberBase(pool, result, location), func(kj::fwd<Func>(func)) {}
-  ~Fiber() noexcept(false) { destroy(); }
+  ~Fiber() noexcept(false) {
+    destroy();
+    // HACK: Make sure we have an active EnvironmentSet scope while we destroy the user callbacks.
+    KJ_IF_MAYBE(set, environmentSet) {
+      environmentSetScope.emplace(*set);
+    }
+  }
 
   typedef FixVoid<decltype(kj::instance<Func&>()(kj::instance<WaitScope&>()))> ResultType;
 
@@ -1055,6 +1229,9 @@ public:
   }
 
 private:
+  Maybe<EnvironmentSet::Scope> environmentSetScope;
+  // HACK: Non-null during destruction, so `func` and `result` get the environment set.
+
   Func func;
   ExceptionOr<ResultType> result;
 
@@ -1198,6 +1375,12 @@ Promise<T> Promise<T>::eagerlyEvaluate(ErrorFunc&& errorHandler, SourceLocation 
 template <typename T>
 Promise<T> Promise<T>::eagerlyEvaluate(decltype(nullptr), SourceLocation location) {
   return Promise(false, _::spark<_::FixVoid<T>>(kj::mv(node), location));
+}
+
+template <typename T>
+Promise<T> Promise<T>::adoptEnvironment() {
+  node->adoptEnvironment();
+  return Promise(false, kj::mv(node));
 }
 
 template <typename T>
@@ -1459,7 +1642,7 @@ class XThreadEvent: private Event,         // it's an event in the target thread
                     public PromiseNode {   // it's a PromiseNode in the requesting thread
 public:
   XThreadEvent(ExceptionOrValue& result, const Executor& targetExecutor, void* funcTracePtr,
-               SourceLocation location);
+               SourceLocation location, bool sync);
 
   void tracePromise(TraceBuilder& builder, bool stopAtNextEvent) override;
 
@@ -1560,8 +1743,8 @@ template <typename Func, typename = _::FixVoid<_::ReturnType<Func, void>>>
 class XThreadEventImpl final: public XThreadEvent {
   // Implementation for a function that does not return a Promise.
 public:
-  XThreadEventImpl(Func&& func, const Executor& target, SourceLocation location)
-      : XThreadEvent(result, target, GetFunctorStartAddress<>::apply(func), location),
+  XThreadEventImpl(Func&& func, const Executor& target, SourceLocation location, bool sync)
+      : XThreadEvent(result, target, GetFunctorStartAddress<>::apply(func), location, sync),
         func(kj::fwd<Func>(func)) {}
   ~XThreadEventImpl() noexcept(false) { ensureDoneOrCanceled(); }
 
@@ -1579,6 +1762,7 @@ public:
 
 private:
   Func func;
+  // TODO(now): Destroy this under environment scope.
   ExceptionOr<ResultT> result;
   friend Executor;
 };
@@ -1587,8 +1771,8 @@ template <typename Func, typename T>
 class XThreadEventImpl<Func, Promise<T>> final: public XThreadEvent {
   // Implementation for a function that DOES return a Promise.
 public:
-  XThreadEventImpl(Func&& func, const Executor& target, SourceLocation location)
-      : XThreadEvent(result, target, GetFunctorStartAddress<>::apply(func), location),
+  XThreadEventImpl(Func&& func, const Executor& target, SourceLocation location, bool sync)
+      : XThreadEvent(result, target, GetFunctorStartAddress<>::apply(func), location, sync),
         func(kj::fwd<Func>(func)) {}
   ~XThreadEventImpl() noexcept(false) { ensureDoneOrCanceled(); }
 
@@ -1616,14 +1800,14 @@ private:
 template <typename Func>
 _::UnwrapPromise<PromiseForResult<Func, void>> Executor::executeSync(
     Func&& func, SourceLocation location) const {
-  _::XThreadEventImpl<Func> event(kj::fwd<Func>(func), *this, location);
+  _::XThreadEventImpl<Func> event(kj::fwd<Func>(func), *this, location, true);
   send(event, true);
   return convertToReturn(kj::mv(event.result));
 }
 
 template <typename Func>
 PromiseForResult<Func, void> Executor::executeAsync(Func&& func, SourceLocation location) const {
-  auto event = kj::heap<_::XThreadEventImpl<Func>>(kj::fwd<Func>(func), *this, location);
+  auto event = kj::heap<_::XThreadEventImpl<Func>>(kj::fwd<Func>(func), *this, location, false);
   send(*event, false);
   return _::PromiseNode::to<PromiseForResult<Func, void>>(kj::mv(event));
 }

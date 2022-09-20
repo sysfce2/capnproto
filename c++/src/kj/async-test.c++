@@ -378,6 +378,9 @@ TEST(Async, SeparateFulfillerVoid) {
 }
 
 TEST(Async, SeparateFulfillerCanceled) {
+  EventLoop loop;
+  WaitScope waitScope(loop);
+
   auto pair = newPromiseAndFulfiller<void>();
 
   EXPECT_TRUE(pair.fulfiller->isWaiting());
@@ -430,6 +433,9 @@ TEST(Async, SeparateFulfillerDiscardedDuringUnwind) {
 #endif
 
 TEST(Async, SeparateFulfillerMemoryLeak) {
+  EventLoop loop;
+  WaitScope waitScope(loop);
+
   auto paf = kj::newPromiseAndFulfiller<void>();
   paf.fulfiller->fulfill();
 }
@@ -1044,7 +1050,7 @@ KJ_TEST("Maximum turn count during wait scope poll is enforced") {
   KJ_EXPECT(evaluated1);
   KJ_EXPECT(evaluated2);
   KJ_EXPECT(!evaluated3);
-  
+
   // Get the last remaining event in the queue:
   count = waitScope.poll(1);
   KJ_ASSERT(count == 1);

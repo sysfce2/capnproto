@@ -47,6 +47,7 @@
 #include "one-of.h"
 #include "function.h"
 #include "list.h"
+#include "map.h"
 #include <deque>
 #include <atomic>
 
@@ -188,6 +189,11 @@ struct DummyFunctor {
 
 class YieldPromiseNode final: public _::PromiseNode {
 public:
+  explicit YieldPromiseNode() {
+    environmentSet = _::EnvironmentSet::tryGetCurrent()
+        .map([](_::EnvironmentSet& set) { return set.clone(); });
+  }
+
   void onReady(_::Event* event) noexcept override {
     if (event) event->armBreadthFirst();
   }
@@ -201,6 +207,11 @@ public:
 
 class YieldHarderPromiseNode final: public _::PromiseNode {
 public:
+  explicit YieldHarderPromiseNode() {
+    environmentSet = _::EnvironmentSet::tryGetCurrent()
+        .map([](_::EnvironmentSet& set) { return set.clone(); });
+  }
+
   void onReady(_::Event* event) noexcept override {
     if (event) event->armLast();
   }
@@ -214,6 +225,11 @@ public:
 
 class NeverDonePromiseNode final: public _::PromiseNode {
 public:
+  explicit NeverDonePromiseNode() {
+    environmentSet = _::EnvironmentSet::tryGetCurrent()
+        .map([](_::EnvironmentSet& set) { return set.clone(); });
+  }
+
   void onReady(_::Event* event) noexcept override {
     // ignore
   }
@@ -315,6 +331,7 @@ class TaskSet::Task final: public _::Event {
 public:
   Task(TaskSet& taskSet, Own<_::PromiseNode>&& nodeParam)
       : Event(taskSet.location), taskSet(taskSet), node(kj::mv(nodeParam)) {
+    // TODO(now): Should I do anything with the returned EnvironmentSet?
     node->setSelfPointer(&node);
     node->onReady(this);
   }
@@ -435,6 +452,82 @@ Promise<void> TaskSet::onEmpty() {
 
 // =======================================================================================
 
+namespace _ {
+
+struct EnvironmentSet::Impl: public Refcounted {
+  HashMap<void*, Own<Environment>> environments;
+  // A map of Environments, keyed by their type IDs.
+};
+
+EnvironmentSet EnvironmentSet::create(void* typeKey, Own<Environment> environment) {
+  // Create a new EnvironmentSet::Impl with the given Environment, adopting any other Environments
+  // that are current.
+
+  // Add our new environment to a new map of environments.
+  auto impl = refcounted<Impl>();
+  auto& environments = impl->environments;
+  environments.insert(typeKey, kj::mv(environment));
+
+  KJ_IF_MAYBE(set, EnvironmentSet::tryGetCurrent()) {
+    // We have a current EnvironmentSet. We'll adopt all its Environments _except_ any identified by
+    // `typeKey`. We can also use its `currentEnvironmentSet` reference, so we don't have to hit
+    // currentEventLoop().
+    auto& currentImpl = *set->impl;
+    for (auto& entry: currentImpl.environments) {
+      if (entry.key != typeKey) {
+        environments.insert(entry.key, addRef(*entry.value));
+      }
+    }
+    KJ_DREQUIRE(&set->currentEnvironmentSet == &currentEventLoop().currentEnvironmentSet,
+        "EnvironmentSet switched EventLoops");
+    return EnvironmentSet(set->currentEnvironmentSet, kj::mv(impl));
+  } else {
+    // No current environment, so we have to call currentEventLoop().
+    return EnvironmentSet(currentEventLoop().currentEnvironmentSet, kj::mv(impl));
+  }
+}
+
+EnvironmentSet::EnvironmentSet(Maybe<EnvironmentSet&>& currentEnvironmentSet, Own<Impl> impl)
+    : currentEnvironmentSet(currentEnvironmentSet),
+      impl(kj::mv(impl)) {}
+
+EnvironmentSet::~EnvironmentSet() noexcept(false) {}
+
+Maybe<Environment&> EnvironmentSet::tryGetEnvironment(void* typeKey) {
+  KJ_IF_MAYBE(env, impl->environments.find(typeKey)) {
+    return **env;
+  } else {
+    return nullptr;
+  }
+}
+
+Maybe<EnvironmentSet&> EnvironmentSet::tryGetCurrent() {
+  return currentEventLoop().currentEnvironmentSet;
+}
+
+EnvironmentSet EnvironmentSet::clone() {
+  KJ_DREQUIRE(&currentEnvironmentSet == &currentEventLoop().currentEnvironmentSet,
+      "EnvironmentSet switched EventLoops");
+  return EnvironmentSet(currentEnvironmentSet, addRef(*impl));
+}
+
+EnvironmentSet::Scope::Scope(EnvironmentSet& set)
+    : currentEnvironmentSet(set.currentEnvironmentSet),
+      previous(currentEnvironmentSet) {
+  KJ_DREQUIRE(&currentEnvironmentSet == &currentEventLoop().currentEnvironmentSet,
+      "EnvironmentSet switched EventLoops");
+  currentEnvironmentSet = set;
+}
+EnvironmentSet::Scope::~Scope() noexcept(false) {
+  currentEnvironmentSet = previous;
+}
+
+Environment::~Environment() noexcept(false) {}
+
+}  // namespace _
+
+// =======================================================================================
+
 namespace {
 
 #if _WIN32 || __CYGWIN__
@@ -484,7 +577,8 @@ public:
     main = {};
   }
 
-  void switchToFiber();
+  void switchToFiber(Maybe<EnvironmentSet&> environmentSet);
+  // `environment`'s may be non-null in an async environment, and must be null in sync.
   void switchToMain();
 
   void trace(TraceBuilder& builder) {
@@ -714,7 +808,7 @@ void FiberPool::runSynchronously(kj::FunctionParam<void()> func) const {
   {
     auto stack = impl->takeStack();
     stack->initialize(syncFunc);
-    stack->switchToFiber();
+    stack->switchToFiber(nullptr);
     stack->reset();  // safe to reuse
   }
 
@@ -893,9 +987,17 @@ namespace _ {  // (private)
 
 XThreadEvent::XThreadEvent(
     ExceptionOrValue& result, const Executor& targetExecutor, void* funcTracePtr,
-    SourceLocation location)
+    SourceLocation location, bool sync)
     : Event(targetExecutor.getLoop(), location), result(result), funcTracePtr(funcTracePtr),
-      targetExecutor(targetExecutor.addRef()) {}
+      targetExecutor(targetExecutor.addRef()) {
+  if (!sync) {
+    // It's only safe to capture the environment in an async context.
+    // XThreadEvent is an Event, but it's an Event in the target thread, so we can't use its loop
+    // reference.
+    environmentSet = EnvironmentSet::tryGetCurrent()
+        .map([](EnvironmentSet& set) { return set.clone(); });
+  }
+}
 
 void XThreadEvent::tracePromise(TraceBuilder& builder, bool stopAtNextEvent) {
   // We can't safely trace into another thread, so we'll stop here.
@@ -1166,7 +1268,10 @@ void XThreadEvent::onReady(Event* event) noexcept {
 }
 
 XThreadPaf::XThreadPaf()
-    : state(WAITING), executor(getCurrentThreadExecutor()) {}
+    : state(WAITING), executor(getCurrentThreadExecutor()) {
+  environmentSet = EnvironmentSet::tryGetCurrent()
+      .map([](EnvironmentSet& set) { return set.clone(); });
+}
 XThreadPaf::~XThreadPaf() noexcept(false) {}
 
 void XThreadPaf::Disposer::disposeImpl(void* pointer) const {
@@ -1585,13 +1690,24 @@ void FiberStack::initialize(SynchronousFunc& func) {
 }
 
 FiberBase::FiberBase(size_t stackSize, _::ExceptionOrValue& result, SourceLocation location)
-    : Event(location),  state(WAITING), stack(kj::heap<FiberStack>(stackSize)), result(result) {
+    : Event(location),
+      state(WAITING),
+      stack(kj::heap<FiberStack>(stackSize)),
+      result(result) {
+  environmentSet = loop.currentEnvironmentSet
+      .map([](EnvironmentSet& set) { return set.clone(); });
+
   stack->initialize(*this);
   ensureThreadCanRunFibers();
 }
 
 FiberBase::FiberBase(const FiberPool& pool, _::ExceptionOrValue& result, SourceLocation location)
-    : Event(location), state(WAITING), result(result) {
+    : Event(location),
+      state(WAITING),
+      result(result) {
+  environmentSet = loop.currentEnvironmentSet
+      .map([](EnvironmentSet& set) { return set.clone(); });
+
   stack = pool.impl->takeStack();
   stack->initialize(*this);
   ensureThreadCanRunFibers();
@@ -1608,7 +1724,7 @@ void FiberBase::destroy() {
       // We can't just free the stack while the fiber is running. We need to force it to execute
       // until finished, so we cause it to throw an exception.
       state = CANCELED;
-      stack->switchToFiber();
+      stack->switchToFiber(environmentSet);
 
       // The fiber should only switch back to the main stack on completion, because any further
       // calls to wait() would throw before trying to switch.
@@ -1635,14 +1751,19 @@ void FiberBase::destroy() {
 Maybe<Own<Event>> FiberBase::fire() {
   KJ_ASSERT(state == WAITING);
   state = RUNNING;
-  stack->switchToFiber();
+  stack->switchToFiber(environmentSet);
   return nullptr;
 }
 
-void FiberStack::switchToFiber() {
+void FiberStack::switchToFiber(Maybe<EnvironmentSet&> environmentSet) {
   // Switch from the main stack to the fiber. Returns once the fiber either calls switchToMain()
   // or returns from its main function.
 #if KJ_USE_FIBERS
+  Maybe<EnvironmentSet::Scope> scope;
+  KJ_IF_MAYBE(set, environmentSet) {
+    // This use of fibers may be asynchronous, so we should try to enter the async environment.
+    scope.emplace(*set);
+  }
 #if _WIN32 || __CYGWIN__
   SwitchToFiber(osFiber);
 #else
@@ -1953,6 +2074,7 @@ void waitImpl(Own<_::PromiseNode>&& node, _::ExceptionOrValue& result, WaitScope
     KJ_REQUIRE(fiber->state == FiberBase::RUNNING,
         "This WaitScope can only be used within the fiber that created it.");
 
+    // TODO(now): Should I do anything with the returned environment set?
     node->setSelfPointer(&node);
     node->onReady(fiber);
 
@@ -1976,6 +2098,7 @@ void waitImpl(Own<_::PromiseNode>&& node, _::ExceptionOrValue& result, WaitScope
     KJ_REQUIRE(!loop.running, "wait() is not allowed from within event callbacks.");
 
     RootEvent doneEvent(node, reinterpret_cast<void*>(&waitImpl), location);
+    // TODO(now): Should I do anything with the returned environment set?
     node->setSelfPointer(&node);
     node->onReady(&doneEvent);
 
@@ -2263,7 +2386,14 @@ kj::String PromiseBase::trace() {
   return kj::str(builder);
 }
 
-void PromiseNode::setSelfPointer(Own<PromiseNode>* selfPtr) noexcept {}
+Maybe<EnvironmentSet&> PromiseNode::setSelfPointer(Own<PromiseNode>*) noexcept {
+  return environmentSet;
+}
+
+void PromiseNode::adoptEnvironment() {
+  environmentSet = EnvironmentSet::tryGetCurrent()
+      .map([](EnvironmentSet& set) { return set.clone(); });
+}
 
 void PromiseNode::OnReadyEvent::init(Event* newEvent) {
   if (event == _kJ_ALREADY_READY) {
@@ -2302,7 +2432,10 @@ void PromiseNode::OnReadyEvent::armBreadthFirst() {
 
 // -------------------------------------------------------------------
 
-ImmediatePromiseNodeBase::ImmediatePromiseNodeBase() {}
+ImmediatePromiseNodeBase::ImmediatePromiseNodeBase() {
+  environmentSet = EnvironmentSet::tryGetCurrent()
+      .map([](EnvironmentSet& set) { return set.clone(); });
+}
 ImmediatePromiseNodeBase::~ImmediatePromiseNodeBase() noexcept(false) {}
 
 void ImmediatePromiseNodeBase::onReady(Event* event) noexcept {
@@ -2326,7 +2459,9 @@ void ImmediateBrokenPromiseNode::get(ExceptionOrValue& output) noexcept {
 
 AttachmentPromiseNodeBase::AttachmentPromiseNodeBase(Own<PromiseNode>&& dependencyParam)
     : dependency(kj::mv(dependencyParam)) {
-  dependency->setSelfPointer(&dependency);
+  environmentSet = dependency->setSelfPointer(&dependency).map([](EnvironmentSet& set) {
+    return set.clone();
+  });
 }
 
 void AttachmentPromiseNodeBase::onReady(Event* event) noexcept {
@@ -2340,8 +2475,7 @@ void AttachmentPromiseNodeBase::get(ExceptionOrValue& output) noexcept {
 void AttachmentPromiseNodeBase::tracePromise(TraceBuilder& builder, bool stopAtNextEvent) {
   dependency->tracePromise(builder, stopAtNextEvent);
 
-  // TODO(debug): Maybe use __builtin_return_address to get the locations that called fork() and
-  //   addBranch()?
+  // TODO(debug): Maybe use __builtin_return_address to get the locations that called attach()?
 }
 
 void AttachmentPromiseNodeBase::dropDependency() {
@@ -2353,7 +2487,11 @@ void AttachmentPromiseNodeBase::dropDependency() {
 TransformPromiseNodeBase::TransformPromiseNodeBase(
     Own<PromiseNode>&& dependencyParam, void* continuationTracePtr)
     : dependency(kj::mv(dependencyParam)), continuationTracePtr(continuationTracePtr) {
-  dependency->setSelfPointer(&dependency);
+  environmentSet = dependency->setSelfPointer(&dependency).map([](EnvironmentSet& set) {
+    return set.clone();
+  });
+
+  // TODO(now): Remove environmentSet local member?
 }
 
 void TransformPromiseNodeBase::onReady(Event* event) noexcept {
@@ -2362,6 +2500,10 @@ void TransformPromiseNodeBase::onReady(Event* event) noexcept {
 
 void TransformPromiseNodeBase::get(ExceptionOrValue& output) noexcept {
   KJ_IF_MAYBE(exception, kj::runCatchingExceptions([&]() {
+    Maybe<EnvironmentSet::Scope> scope;
+    KJ_IF_MAYBE(set, environmentSet) {
+      scope.emplace(*set);
+    }
     getImpl(output);
     dropDependency();
   })) {
@@ -2400,6 +2542,11 @@ void TransformPromiseNodeBase::getDepResult(ExceptionOrValue& output) {
 // -------------------------------------------------------------------
 
 ForkBranchBase::ForkBranchBase(Own<ForkHubBase>&& hubParam): hub(kj::mv(hubParam)) {
+  environmentSet = hub->environmentSet.map([](EnvironmentSet& set) {
+    // TODO(now): Do I need to clone(), or can I just capture a C++ ref? Will I need the
+    //   EnvironmentSet after releaseHub() is called?
+    return set.clone();
+  });
   if (hub->tailBranch == nullptr) {
     onReadyEvent.arm();
   } else {
@@ -2451,7 +2598,11 @@ void ForkBranchBase::tracePromise(TraceBuilder& builder, bool stopAtNextEvent) {
 ForkHubBase::ForkHubBase(Own<PromiseNode>&& innerParam, ExceptionOrValue& resultRef,
                          SourceLocation location)
     : Event(location), inner(kj::mv(innerParam)), resultRef(resultRef) {
-  inner->setSelfPointer(&inner);
+  // TODO(now): Move to initializer list?
+  // Note that since ForkHubBase is an Event, we could also capture its loop.currentEventSet.
+  environmentSet = inner->setSelfPointer(&inner).map([](EnvironmentSet& set) {
+    return set.clone();
+  });
   inner->onReady(this);
 }
 
@@ -2492,7 +2643,9 @@ void ForkHubBase::traceEvent(TraceBuilder& builder) {
 
 ChainPromiseNode::ChainPromiseNode(Own<PromiseNode> innerParam, SourceLocation location)
     : Event(location), state(STEP1), inner(kj::mv(innerParam)) {
-  inner->setSelfPointer(&inner);
+  environmentSet = inner->setSelfPointer(&inner).map([](EnvironmentSet& set) {
+    return set.clone();
+  });
   inner->onReady(this);
 }
 
@@ -2510,12 +2663,13 @@ void ChainPromiseNode::onReady(Event* event) noexcept {
   KJ_UNREACHABLE;
 }
 
-void ChainPromiseNode::setSelfPointer(Own<PromiseNode>* selfPtr) noexcept {
+Maybe<EnvironmentSet&> ChainPromiseNode::setSelfPointer(Own<PromiseNode>* selfPtr) noexcept {
   if (state == STEP2) {
     *selfPtr = kj::mv(inner);  // deletes this!
-    selfPtr->get()->setSelfPointer(selfPtr);
+    return selfPtr->get()->setSelfPointer(selfPtr);
   } else {
     this->selfPtr = selfPtr;
+    return environmentSet;
   }
 }
 
@@ -2554,6 +2708,7 @@ Maybe<Own<Event>> ChainPromiseNode::fire() {
     // There is an exception.  If there is also a value, delete it.
     kj::runCatchingExceptions([&]() { intermediate.value = nullptr; });
     // Now set step2 to a rejected promise.
+    // TODO(now): Propagate my environment to this immediate node.
     inner = heap<ImmediateBrokenPromiseNode>(kj::mv(*exception));
   } else KJ_IF_MAYBE(value, intermediate.value) {
     // There is a value and no exception.  The value is itself a promise.  Adopt it as our
@@ -2570,6 +2725,7 @@ Maybe<Own<Event>> ChainPromiseNode::fire() {
     // Hey, we can shorten the chain here.
     auto chain = selfPtr->downcast<ChainPromiseNode>();
     *selfPtr = kj::mv(inner);
+    // TODO(now): Do I need to do anything with the returned environment?
     selfPtr->get()->setSelfPointer(selfPtr);
     if (onReadyEvent != nullptr) {
       selfPtr->get()->onReady(onReadyEvent);
@@ -2578,6 +2734,7 @@ Maybe<Own<Event>> ChainPromiseNode::fire() {
     // Return our self-pointer so that the caller takes care of deleting it.
     return Own<Event>(kj::mv(chain));
   } else {
+    // TODO(now): Do I need to do anything with the returned environment?
     inner->setSelfPointer(&inner);
     if (onReadyEvent != nullptr) {
       inner->onReady(onReadyEvent);
@@ -2639,8 +2796,23 @@ void ExclusiveJoinPromiseNode::tracePromise(TraceBuilder& builder, bool stopAtNe
 ExclusiveJoinPromiseNode::Branch::Branch(
     ExclusiveJoinPromiseNode& joinNode, Own<PromiseNode> dependencyParam, SourceLocation location)
     : Event(location), joinNode(joinNode), dependency(kj::mv(dependencyParam)) {
-  dependency->setSelfPointer(&dependency);
+  auto maybeDepEnvSetRef = dependency->setSelfPointer(&dependency);
   dependency->onReady(this);
+
+  // TODO(now): Clean this up, yuck.
+  KJ_IF_MAYBE(set, joinNode.environmentSet) {
+#ifdef KJ_DEBUG
+    // We are not joining two environments. I suppose we _could_, but the risks aren't clear to me.
+    auto& depEnv = KJ_REQUIRE_NONNULL(maybeDepEnvSetRef,
+        "Attempt to join null environment with non-null environment.");
+    KJ_REQUIRE(*set == depEnv, "Attempt to join two different environments.");
+#endif  // KJ_DEBUG
+  } else {
+    // TODO(now): Better to capture the Event base class's loop.currentEnvironmentSet?
+    joinNode.environmentSet = maybeDepEnvSetRef.map([](EnvironmentSet& set) {
+      return set.clone();
+    });
+  }
 }
 
 ExclusiveJoinPromiseNode::Branch::~Branch() noexcept(false) {}
@@ -2733,8 +2905,22 @@ ArrayJoinPromiseNodeBase::Branch::Branch(
     ArrayJoinPromiseNodeBase& joinNode, Own<PromiseNode> dependencyParam, ExceptionOrValue& output,
     SourceLocation location)
     : Event(location), joinNode(joinNode), dependency(kj::mv(dependencyParam)), output(output) {
-  dependency->setSelfPointer(&dependency);
+  auto maybeDepEnvSetRef = dependency->setSelfPointer(&dependency);
   dependency->onReady(this);
+
+  // TODO(now): Clean this up, yuck.
+  KJ_IF_MAYBE(set, joinNode.environmentSet) {
+#ifdef KJ_DEBUG
+    // We are not joining two environments. I suppose we _could_, but the risks aren't clear to me.
+    auto& depEnv = KJ_REQUIRE_NONNULL(maybeDepEnvSetRef,
+        "Attempt to join null environment with non-null environment.");
+    KJ_REQUIRE(*set == depEnv, "Attempt to join two different environments.");
+#endif  // KJ_DEBUG
+  } else {
+    joinNode.environmentSet = maybeDepEnvSetRef.map([](EnvironmentSet& set) {
+      return set.clone();
+    });
+  }
 }
 
 ArrayJoinPromiseNodeBase::Branch::~Branch() noexcept(false) {}
@@ -2784,7 +2970,10 @@ namespace _ {  // (private)
 EagerPromiseNodeBase::EagerPromiseNodeBase(
     Own<PromiseNode>&& dependencyParam, ExceptionOrValue& resultRef, SourceLocation location)
     : Event(location), dependency(kj::mv(dependencyParam)), resultRef(resultRef) {
-  dependency->setSelfPointer(&dependency);
+  // TODO(now): Use loop.currentEnvironmentSet?
+  environmentSet = dependency->setSelfPointer(&dependency).map([](EnvironmentSet& set) {
+    return set.clone();
+  });
   dependency->onReady(this);
 }
 
@@ -2823,6 +3012,11 @@ Maybe<Own<Event>> EagerPromiseNodeBase::fire() {
 }
 
 // -------------------------------------------------------------------
+
+AdapterPromiseNodeBase::AdapterPromiseNodeBase() {
+  environmentSet = EnvironmentSet::tryGetCurrent()
+      .map([](EnvironmentSet& set) { return set.clone(); });
+}
 
 void AdapterPromiseNodeBase::onReady(Event* event) noexcept {
   onReadyEvent.init(event);
@@ -2875,7 +3069,10 @@ CoroutineBase::CoroutineBase(stdcoro::coroutine_handle<> coroutine, ExceptionOrV
                              SourceLocation location)
     : Event(location),
       coroutine(coroutine),
-      resultRef(resultRef) {}
+      resultRef(resultRef) {
+  environmentSet = loop.currentEnvironmentSet
+      .map([](EnvironmentSet& set) { return set.clone(); });
+}
 CoroutineBase::~CoroutineBase() noexcept(false) {
   readMaybe(maybeDisposalResults)->destructorRan = true;
 }
@@ -2950,7 +3147,14 @@ Maybe<Own<Event>> CoroutineBase::fire() {
 
   promiseNodeForTrace = nullptr;
 
-  coroutine.resume();
+  {
+    // TODO(now): Get loop ref from base class.
+    Maybe<EnvironmentSet::Scope> scope;
+    KJ_IF_MAYBE(set, environmentSet) {
+      scope.emplace(*set);
+    }
+    coroutine.resume();
+  }
 
   return nullptr;
 }
@@ -3001,6 +3205,10 @@ void CoroutineBase::destroy() {
     // On Clang, `disposalResults.exception != nullptr` implies `!disposalResults.destructorRan`.
     // We could optimize out the separate `destructorRan` flag if we verify that other compilers
     // behave the same way.
+    Maybe<EnvironmentSet::Scope> scope;
+    KJ_IF_MAYBE(set, environmentSet) {
+      scope.emplace(*set);
+    }
     coroutine.destroy();
   } while (!disposalResults.destructorRan);
 
@@ -3040,7 +3248,14 @@ void CoroutineBase::AwaiterBase::getImpl(ExceptionOrValue& result) {
 }
 
 bool CoroutineBase::AwaiterBase::awaitSuspendImpl(CoroutineBase& coroutineEvent) {
-  node->setSelfPointer(&node);
+  KJ_IF_MAYBE(set, node->setSelfPointer(&node)) {
+#ifdef KJ_DEBUG
+    auto& coroEnv = KJ_REQUIRE_NONNULL(coroutineEvent.environmentSet,
+        "Coroutine with null environment awaiting promise with non-null environment.");
+    KJ_REQUIRE(*set == coroEnv,
+        "Coroutine awaiting promise from different environment.");
+#endif  // KJ_DEBUG
+  }
   node->onReady(&coroutineEvent);
 
   if (coroutineEvent.hasSuspendedAtLeastOnce && coroutineEvent.isNext()) {
@@ -3064,6 +3279,10 @@ bool CoroutineBase::AwaiterBase::awaitSuspendImpl(CoroutineBase& coroutineEvent)
     return true;
   }
 }
+
+// -------------------------------------------------------------------
+
+
 
 }  // namespace _ (private)
 
