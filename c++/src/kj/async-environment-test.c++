@@ -350,5 +350,31 @@ KJ_TEST("Environments are available in suspended coroutine destructors") {
 
 #endif  // KJ_HAS_COROUTINE
 
+kj::Promise<uint> asyncAccumulate(uint z, uint ttl) {
+  if (ttl == 0) return z;
+  z += ttl;
+  return evalLater([z, ttl]() {
+    return asyncAccumulate(z, ttl - tryGetEnvironment<uint>().orDefault(1));
+  });
+}
+
+KJ_TEST("benchmark: Environment-less evalLater()") {
+  EventLoop eventLoop;
+  WaitScope waitScope(eventLoop);
+
+  asyncAccumulate(0, 10'000'000).wait(waitScope);
+}
+
+KJ_TEST("benchmark: Environment-ful evalLater()") {
+  EventLoop eventLoop;
+  WaitScope waitScope(eventLoop);
+
+  runInEnvironment(uint(1), []() {
+    return asyncAccumulate(0, 10'000'000);
+  }).wait(waitScope);
+}
+
+// TODO(now): Compare against asyncAccumulate() before PR.
+
 }  // namespace
 }  // namespace kj
