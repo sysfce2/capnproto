@@ -190,8 +190,8 @@ struct DummyFunctor {
 class YieldPromiseNode final: public _::PromiseNode {
 public:
   explicit YieldPromiseNode() {
-    environmentSet = _::EnvironmentSet::tryGetCurrent()
-        .map([](_::EnvironmentSet& set) { return set.clone(); });
+    //environmentSet = _::EnvironmentSet::tryGetCurrent()
+    //    .map([](_::EnvironmentSet& set) { return set.clone(); });
   }
 
   void onReady(_::Event* event) noexcept override {
@@ -208,8 +208,8 @@ public:
 class YieldHarderPromiseNode final: public _::PromiseNode {
 public:
   explicit YieldHarderPromiseNode() {
-    environmentSet = _::EnvironmentSet::tryGetCurrent()
-        .map([](_::EnvironmentSet& set) { return set.clone(); });
+    //environmentSet = _::EnvironmentSet::tryGetCurrent()
+    //    .map([](_::EnvironmentSet& set) { return set.clone(); });
   }
 
   void onReady(_::Event* event) noexcept override {
@@ -226,8 +226,8 @@ public:
 class NeverDonePromiseNode final: public _::PromiseNode {
 public:
   explicit NeverDonePromiseNode() {
-    environmentSet = _::EnvironmentSet::tryGetCurrent()
-        .map([](_::EnvironmentSet& set) { return set.clone(); });
+    //environmentSet = _::EnvironmentSet::tryGetCurrent()
+    //    .map([](_::EnvironmentSet& set) { return set.clone(); });
   }
 
   void onReady(_::Event* event) noexcept override {
@@ -994,8 +994,8 @@ XThreadEvent::XThreadEvent(
     // It's only safe to capture the environment in an async context.
     // XThreadEvent is an Event, but it's an Event in the target thread, so we can't use its loop
     // reference.
-    environmentSet = EnvironmentSet::tryGetCurrent()
-        .map([](EnvironmentSet& set) { return set.clone(); });
+    //environmentSet = EnvironmentSet::tryGetCurrent()
+    //    .map([](EnvironmentSet& set) { return set.clone(); });
   }
 }
 
@@ -1269,8 +1269,8 @@ void XThreadEvent::onReady(Event* event) noexcept {
 
 XThreadPaf::XThreadPaf()
     : state(WAITING), executor(getCurrentThreadExecutor()) {
-  environmentSet = EnvironmentSet::tryGetCurrent()
-      .map([](EnvironmentSet& set) { return set.clone(); });
+  //environmentSet = EnvironmentSet::tryGetCurrent()
+  //    .map([](EnvironmentSet& set) { return set.clone(); });
 }
 XThreadPaf::~XThreadPaf() noexcept(false) {}
 
@@ -2433,8 +2433,8 @@ void PromiseNode::OnReadyEvent::armBreadthFirst() {
 // -------------------------------------------------------------------
 
 ImmediatePromiseNodeBase::ImmediatePromiseNodeBase() {
-  environmentSet = EnvironmentSet::tryGetCurrent()
-      .map([](EnvironmentSet& set) { return set.clone(); });
+  //environmentSet = EnvironmentSet::tryGetCurrent()
+  //    .map([](EnvironmentSet& set) { return set.clone(); });
 }
 ImmediatePromiseNodeBase::~ImmediatePromiseNodeBase() noexcept(false) {}
 
@@ -2490,8 +2490,6 @@ TransformPromiseNodeBase::TransformPromiseNodeBase(
   environmentSet = dependency->setSelfPointer(&dependency).map([](EnvironmentSet& set) {
     return set.clone();
   });
-
-  // TODO(now): Remove environmentSet local member?
 }
 
 void TransformPromiseNodeBase::onReady(Event* event) noexcept {
@@ -2643,6 +2641,7 @@ void ForkHubBase::traceEvent(TraceBuilder& builder) {
 
 ChainPromiseNode::ChainPromiseNode(Own<PromiseNode> innerParam, SourceLocation location)
     : Event(location), state(STEP1), inner(kj::mv(innerParam)) {
+  // TODO(now): Could get loop.currentEnvironmentSet.
   environmentSet = inner->setSelfPointer(&inner).map([](EnvironmentSet& set) {
     return set.clone();
   });
@@ -3014,8 +3013,8 @@ Maybe<Own<Event>> EagerPromiseNodeBase::fire() {
 // -------------------------------------------------------------------
 
 AdapterPromiseNodeBase::AdapterPromiseNodeBase() {
-  environmentSet = EnvironmentSet::tryGetCurrent()
-      .map([](EnvironmentSet& set) { return set.clone(); });
+  //environmentSet = EnvironmentSet::tryGetCurrent()
+  //    .map([](EnvironmentSet& set) { return set.clone(); });
 }
 
 void AdapterPromiseNodeBase::onReady(Event* event) noexcept {
