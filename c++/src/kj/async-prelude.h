@@ -222,11 +222,16 @@ public:
   kj::String trace();
   // Dump debug info about this promise.
 
+  PromiseBase(PromiseBase&&) = default;
+  PromiseBase& operator=(PromiseBase&&) = default;
+  ~PromiseBase() noexcept(false);
+
 private:
   Own<PromiseNode> node;
 
   PromiseBase() = default;
   PromiseBase(Own<PromiseNode>&& node): node(kj::mv(node)) {}
+  KJ_DISALLOW_COPY(PromiseBase);
 
   template <typename>
   friend class kj::Promise;

@@ -521,15 +521,7 @@ public:
     // We need to make sure the dependency is deleted before we delete the attachment because the
     // dependency may be using the attachment.
     dropDependency();
-
-    // HACK: Make sure we have an active EnvironmentSet scope while we destroy the user callbacks.
-    KJ_IF_MAYBE(set, environmentSet) {
-      environmentSetScope.emplace(*set);
-    }
   }
-
-  Maybe<EnvironmentSet::Scope> environmentSetScope;
-  // HACK: Non-null during destruction, so `attachment` gets the environment set.
 
   Attachment attachment;
 };
@@ -703,17 +695,9 @@ public:
     // is a common pattern for the continuations to hold ownership of objects that might be in-use
     // by the dependency.
     dropDependency();
-
-    // HACK: Make sure we have an active EnvironmentSet scope while we destroy the user callbacks.
-    KJ_IF_MAYBE(set, environmentSet) {
-      environmentSetScope.emplace(*set);
-    }
   }
 
 private:
-  Maybe<EnvironmentSet::Scope> environmentSetScope;
-  // HACK: Non-null during destruction, so `func` and `errorHandler` get the environment set.
-
   Func func;
   ErrorFunc errorHandler;
 
@@ -1139,8 +1123,6 @@ private:
   bool waiting = true;
   Adapter adapter;
   // TODO(now): Destroy adapter under an EnvironmentSet::Scope.
-  // TODO(now): Idea: we capture the current EnvironmentSet from onReady(). If we're destroyed
-  //   _before_ onReady() is called, we can call currentEventLoop() then.
 
   void fulfill(T&& value) override {
     if (waiting) {
@@ -1215,10 +1197,6 @@ public:
       : FiberBase(pool, result, location), func(kj::fwd<Func>(func)) {}
   ~Fiber() noexcept(false) {
     destroy();
-    // HACK: Make sure we have an active EnvironmentSet scope while we destroy the user callbacks.
-    KJ_IF_MAYBE(set, environmentSet) {
-      environmentSetScope.emplace(*set);
-    }
   }
 
   typedef FixVoid<decltype(kj::instance<Func&>()(kj::instance<WaitScope&>()))> ResultType;
@@ -1229,9 +1207,6 @@ public:
   }
 
 private:
-  Maybe<EnvironmentSet::Scope> environmentSetScope;
-  // HACK: Non-null during destruction, so `func` and `result` get the environment set.
-
   Func func;
   ExceptionOr<ResultType> result;
 

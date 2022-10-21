@@ -2386,6 +2386,18 @@ kj::String PromiseBase::trace() {
   return kj::str(builder);
 }
 
+PromiseBase::~PromiseBase() noexcept(false) {
+  // HACK ... In particular, this doesn't account for destroying `dependency` in
+  //   TransformPromiseNodeBase::getDepResult()
+  if (node.get() != nullptr) {
+    Maybe<EnvironmentSet::Scope> scope;
+    KJ_IF_MAYBE(set, node->setSelfPointer(&node)) {
+      scope.emplace(*set);
+    }
+    node = nullptr;
+  }
+}
+
 Maybe<EnvironmentSet&> PromiseNode::setSelfPointer(Own<PromiseNode>*) noexcept {
   return environmentSet;
 }
@@ -3147,7 +3159,6 @@ Maybe<Own<Event>> CoroutineBase::fire() {
   promiseNodeForTrace = nullptr;
 
   {
-    // TODO(now): Get loop ref from base class.
     Maybe<EnvironmentSet::Scope> scope;
     KJ_IF_MAYBE(set, environmentSet) {
       scope.emplace(*set);
